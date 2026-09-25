@@ -1,13 +1,8 @@
-import uvicorn
-from fastapi import FastAPI
+"""便捷入口：等价于 `python -m rpc_gateway.localstack`。
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
-
+启动本地多上游 JSON-RPC 网关与 3 个模拟节点。
+"""
+from rpc_gateway.localstack import main
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=0)
+    main()
