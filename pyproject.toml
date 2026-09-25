@@ -4,8 +4,22 @@ version = "0.1.0"
 requires-python = ">=3.14.4"
 dependencies = [
     "fastapi[standard]>=0.141.1",
+    "httpx>=0.28.1",
 ]
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
