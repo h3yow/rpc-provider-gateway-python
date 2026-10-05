@@ -1,12 +1,13 @@
-"""FastAPI 入口：暴露 JSON-RPC 端点与管理接口。"""
+"""FastAPI 入口：暴露 JSON-RPC 端点与管理接口（含运行时上游热变更）。"""
 from __future__ import annotations
 
 import itertools
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 from .errors import ErrorKind, GatewayError
 from .router import Router
@@ -37,8 +38,25 @@ def make_http_transport(client: httpx.AsyncClient):
     return transport
 
 
+def _node_dict(n: UpstreamNode, unified_head: int) -> dict:
+    return {"name": n.name, "url": n.url, "priority": n.priority,
+            "weight": n.weight, "state": n.state.value, "healthy": n.healthy,
+            "consecutive_failures": n.consecutive_failures,
+            "chain_head": n.chain_head, "head_known": n.head_known,
+            "synced": n.chain_head >= unified_head}
+
+
 def create_app(router: Router) -> FastAPI:
-    app = FastAPI(title="rpc-provider-gateway")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # 自愈探测循环随服务启动；探测通道独立于正常流量
+        if router.prober is not None:
+            await router.prober.start()
+        yield
+        if router.prober is not None:
+            await router.prober.stop()
+
+    app = FastAPI(title="rpc-provider-gateway", lifespan=lifespan)
 
     @app.post("/rpc")
     async def rpc(payload: dict, request: Request) -> dict:
@@ -61,13 +79,60 @@ def create_app(router: Router) -> FastAPI:
 
     @app.get("/upstreams")
     async def upstreams() -> list[dict]:
-        return [
-            {"name": n.name, "url": n.url, "priority": n.priority,
-             "weight": n.weight, "healthy": n.healthy,
-             "consecutive_failures": n.consecutive_failures,
-             "chain_head": n.chain_head}
-            for n in router.registry.all_nodes()
-        ]
+        unified = router.registry.unified_chain_head()
+        return [_node_dict(n, unified) for n in router.registry.all_nodes()]
+
+    @app.post("/upstreams", status_code=201)
+    async def add_upstream(payload: dict) -> dict:
+        """运行时热加入节点：以 JOINING 状态进入，探测对齐后才参与选路。"""
+        try:
+            node = UpstreamNode(
+                name=str(payload["name"]), url=str(payload["url"]),
+                priority=int(payload.get("priority", 0)),
+                weight=int(payload.get("weight", 1)),
+                timeout=float(payload.get("timeout", 5.0)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400,
+                                detail=f"invalid upstream spec: {exc}")
+        try:
+            await router.registry.add_node(node)
+        except GatewayError as exc:
+            raise HTTPException(status_code=409, detail=exc.message)
+        logger.info("admin: upstream added via API: %s", node.name)
+        return _node_dict(node, router.registry.unified_chain_head())
+
+    @app.delete("/upstreams/{name}")
+    async def remove_upstream(name: str) -> dict:
+        """运行时下线节点：立即退出后续选路；在途请求按进入时的结论收尾。"""
+        try:
+            node = await router.registry.remove_node(name)
+        except GatewayError as exc:
+            raise HTTPException(status_code=404, detail=exc.message)
+        if router.prober is not None:
+            router.prober.forget(name)
+        logger.info("admin: upstream removed via API: %s", name)
+        return _node_dict(node, router.registry.unified_chain_head())
+
+    @app.patch("/upstreams/{name}")
+    async def update_upstream(name: str, payload: dict) -> dict:
+        """运行时调整优先级/权重/超时，对之后的选路立即生效。"""
+        try:
+            node = await router.registry.update_node(
+                name,
+                priority=payload.get("priority"),
+                weight=payload.get("weight"),
+                timeout=payload.get("timeout"),
+            )
+        except GatewayError as exc:
+            raise HTTPException(status_code=404, detail=exc.message)
+        logger.info("admin: upstream updated via API: %s", name)
+        return _node_dict(node, router.registry.unified_chain_head())
+
+    @app.get("/chainhead")
+    async def chainhead() -> dict:
+        """统一链头口径及其判断依据（法定人数、各节点高度与同步状态）。"""
+        return router.registry.chain_head_status()
 
     @app.get("/quota/{caller}")
     async def quota_stats(caller: str) -> dict:

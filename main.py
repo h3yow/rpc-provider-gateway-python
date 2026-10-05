@@ -17,6 +17,7 @@ from gateway.cache import ResultCache
 from gateway.mock_node import MockNode
 from gateway.mock_server import create_mock_app
 from gateway.quota import QuotaConfig, QuotaManager
+from gateway.recovery import RecoveryConfig
 from gateway.router import Router
 from gateway.server import create_app, make_http_transport
 from gateway.upstream import UpstreamNode, UpstreamRegistry
@@ -41,7 +42,10 @@ async def serve() -> None:
     router = Router(registry, ResultCache(),
                     QuotaManager(QuotaConfig(rate_per_second=50, burst=50,
                                              max_concurrent=20)),
-                    transport=make_http_transport(client))
+                    transport=make_http_transport(client),
+                    recovery_config=RecoveryConfig(initial_interval=2.0,
+                                                   max_interval=15.0,
+                                                   successes_needed=2))
 
     configs = [
         uvicorn.Config(create_mock_app(mocks[name]), host="127.0.0.1", port=port,

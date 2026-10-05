@@ -1,4 +1,4 @@
-"""路由引擎：组合配额、缓存、上游选择与故障转移。"""
+"""路由引擎：组合配额、缓存、上游选择、故障转移与统一链头口径。"""
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +12,7 @@ from .cache import CachePolicy, ResultCache
 from .errors import ErrorKind, GatewayError
 from .mock_node import MockUpstreamError
 from .quota import QuotaManager
+from .recovery import RecoveryConfig, RecoveryProber
 from .upstream import UpstreamNode, UpstreamRegistry
 
 logger = logging.getLogger("gateway.router")
@@ -56,12 +57,18 @@ class Router:
         quota: QuotaManager,
         transport: Transport,
         max_retries: int = 3,
+        recovery_config: RecoveryConfig | None = None,
     ) -> None:
         self.registry = registry
         self.cache = cache
         self.quota = quota
         self.transport = transport
         self.max_retries = max_retries
+        # 传入恢复配置即启用自愈探测；探测走独立通道，不占用配额、不经过缓存
+        self.prober: RecoveryProber | None = (
+            RecoveryProber(registry, transport, recovery_config)
+            if recovery_config is not None else None
+        )
 
     async def call(
         self, method: str, params: list | None, caller: str = "anonymous"
@@ -71,51 +78,76 @@ class Router:
         key = cache_mod.make_key(method, params)
 
         if policy != CachePolicy.NON_CACHEABLE:
-            hit, value = await self.cache.get(key, self.registry.max_chain_head())
+            hit, value = await self.cache.get(key, self.registry.unified_chain_head())
             if hit:
                 logger.info("served from cache: method=%s caller=%s", method, caller)
                 return value
 
         # 配额一次请求只获取一次：故障转移重试不会重复扣减
-        head_before = self.registry.max_chain_head()
+        head_before = self.registry.unified_chain_head()
         permit = await self.quota.acquire(caller)
         async with permit:
-            result = await self._dispatch_with_failover(method, params, policy)
+            result, node = await self._dispatch_with_failover(method, params, policy)
 
         if policy != CachePolicy.NON_CACHEABLE:
-            # 条目按“抓取开始时网关已知链头”盖章；若抓取期间链头已前进，
+            # 条目按“抓取开始时网关的统一链头口径”盖章；若抓取期间口径已前进，
             # 该条目会在下次读取时被判过期，从而杜绝过期读。
             stamp = head_before
             extracted = self._extract_chain_head(method, result)
             if extracted is not None:
                 stamp = max(stamp, extracted)
-            await self.cache.put(key, result, stamp, policy)
+            if (policy == CachePolicy.HEAD_BOUND
+                    and node.head_known and node.chain_head < head_before):
+                # 落后节点返回的内容不得当成最新状态：结果照常返回给调用方
+                # （可用性），但不写入缓存，避免污染后续读取。
+                logger.info("head-bound result not cached: served by lagging node %s "
+                            "(node_head=%d < unified_head=%d)",
+                            node.name, node.chain_head, head_before)
+            else:
+                await self.cache.put(key, result, stamp, policy)
         return result
 
     async def refresh_chain_head(self) -> int:
-        """主动向上游轮询链头并失效过期缓存。
+        """轮询全部 ACTIVE 节点的链头，刷新统一口径并失效过期缓存。
 
         网关通过此方法（周期任务或测试显式触发）感知链头前进；
-        HEAD_BOUND 条目在网关观测到更高链头后立即失效。
+        口径由过半数节点确认后才前进（棘轮，只增不减），个别节点单方面
+        领先或落后都不会扭曲口径。HEAD_BOUND 条目在口径前进后立即失效。
         """
-        node = await self.registry.select()
-        result = await self.transport(node, "eth_blockNumber", [])
-        head = int(result, 16) if isinstance(result, str) else 0
-        await self.registry.report_success(node, head)
-        invalidated = await self.cache.invalidate_below(head)
-        logger.info("chain head refreshed: head=%d invalidated=%d", head, invalidated)
-        return head
+        nodes = self.registry.active_nodes()
+        for node in nodes:
+            try:
+                result = await asyncio.wait_for(
+                    self.transport(node, "eth_blockNumber", []),
+                    timeout=node.timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 - 轮询失败按健康证据处理
+                error = _normalize(exc)
+                await self.registry.report_failure(node, error)
+                logger.warning("chain head poll failed: node=%s kind=%s",
+                               node.name, error.kind.value)
+                continue
+            head = int(result, 16) if isinstance(result, str) else 0
+            await self.registry.report_success(node, head)
+        unified = self.registry.unified_chain_head()
+        invalidated = await self.cache.invalidate_below(unified)
+        logger.info("chain head refreshed: unified_head=%d invalidated=%d",
+                    unified, invalidated)
+        return unified
 
     async def _dispatch_with_failover(
         self, method: str, params: list | None, policy: CachePolicy
-    ) -> Any:
+    ) -> tuple[Any, UpstreamNode]:
+        """执行调用并在节点间转移；返回 (结果, 实际服务的节点)。"""
         tried: set[str] = set()
         last_error: GatewayError | None = None
         idempotent = policy != CachePolicy.NON_CACHEABLE
+        head_bound = policy == CachePolicy.HEAD_BOUND
 
         for attempt in range(self.max_retries):
             try:
-                node = await self.registry.select(exclude=tried)
+                node = await self.registry.select(exclude=tried,
+                                                  require_synced=head_bound)
             except GatewayError as exc:
                 # 无更多健康节点可转移
                 raise last_error if last_error is not None else exc
@@ -140,15 +172,15 @@ class Router:
                 if not can_retry:
                     raise error
                 continue
-            # 成功：上报健康并同步链头，随后主动失效过期缓存
+            # 成功：上报健康并同步链头，随后按统一口径主动失效过期缓存
             head = self._extract_chain_head(method, result)
             await self.registry.report_success(node, head)
-            new_head = self.registry.max_chain_head()
-            if new_head > 0:
-                await self.cache.invalidate_below(new_head)
+            unified = self.registry.unified_chain_head()
+            if unified > 0:
+                await self.cache.invalidate_below(unified)
             logger.info("request served: method=%s node=%s attempt=%d",
                         method, node.name, attempt + 1)
-            return result
+            return result, node
         raise last_error if last_error is not None else GatewayError(
             ErrorKind.NO_HEALTHY_UPSTREAM, "no healthy upstream available",
             retryable=True,
@@ -156,10 +188,13 @@ class Router:
 
     @staticmethod
     def _extract_chain_head(method: str, result: Any) -> int | None:
-        """从响应中提取链头高度（仅 eth_blockNumber 直接给出）。"""
-        if method == "eth_blockNumber" and isinstance(result, str):
-            try:
+        """从响应中提取链头高度（eth_blockNumber 与按号取块直接给出）。"""
+        try:
+            if method == "eth_blockNumber" and isinstance(result, str):
                 return int(result, 16)
-            except ValueError:
-                return None
+            if (method == "eth_getBlockByNumber" and isinstance(result, dict)
+                    and isinstance(result.get("number"), str)):
+                return int(result["number"], 16)
+        except ValueError:
+            return None
         return None
