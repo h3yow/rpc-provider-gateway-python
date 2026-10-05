@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
+from pydantic import BaseModel
 
 from .errors import ErrorKind, GatewayError
 from .router import Router
@@ -37,6 +38,19 @@ def make_http_transport(client: httpx.AsyncClient):
     return transport
 
 
+class UpstreamConfig(BaseModel):
+    name: str
+    url: str
+    priority: int = 0
+    weight: int = 1
+    timeout: float = 5.0
+
+
+class UpstreamPatch(BaseModel):
+    priority: int | None = None
+    weight: int | None = None
+
+
 def create_app(router: Router) -> FastAPI:
     app = FastAPI(title="rpc-provider-gateway")
 
@@ -60,14 +74,38 @@ def create_app(router: Router) -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/upstreams")
-    async def upstreams() -> list[dict]:
-        return [
-            {"name": n.name, "url": n.url, "priority": n.priority,
-             "weight": n.weight, "healthy": n.healthy,
-             "consecutive_failures": n.consecutive_failures,
-             "chain_head": n.chain_head}
-            for n in router.registry.all_nodes()
-        ]
+    async def upstreams() -> dict:
+        # 统一链头口径、法定人数与判断依据均在此可见，便于定位节点分歧
+        return router.registry.status()
+
+    @app.post("/admin/upstreams")
+    async def add_upstream(cfg: UpstreamConfig) -> dict:
+        node = UpstreamNode(name=cfg.name, url=cfg.url, priority=cfg.priority,
+                            weight=cfg.weight, timeout=cfg.timeout)
+        try:
+            router.registry.add_node(node)
+        except ValueError as exc:
+            raise GatewayError(ErrorKind.INVALID_REQUEST, str(exc)) from exc
+        return {"added": cfg.name, "revision": router.registry.revision,
+                "warming": True}
+
+    @app.patch("/admin/upstreams/{name}")
+    async def patch_upstream(name: str, patch: UpstreamPatch) -> dict:
+        try:
+            node = router.registry.update_node(
+                name, priority=patch.priority, weight=patch.weight)
+        except KeyError as exc:
+            raise GatewayError(ErrorKind.INVALID_REQUEST, str(exc)) from exc
+        return {"name": name, "priority": node.priority,
+                "weight": node.weight, "revision": router.registry.revision}
+
+    @app.delete("/admin/upstreams/{name}")
+    async def remove_upstream(name: str) -> dict:
+        removed = router.registry.remove_node(name)
+        if not removed:
+            raise GatewayError(ErrorKind.INVALID_REQUEST,
+                               f"upstream not active: {name}")
+        return {"removed": name, "revision": router.registry.revision}
 
     @app.get("/quota/{caller}")
     async def quota_stats(caller: str) -> dict:

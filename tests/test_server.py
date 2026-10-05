@@ -71,6 +71,9 @@ async def test_management_endpoints(harness_factory):
     async with _client(h) as client:
         assert (await client.get("/healthz")).json()["status"] == "ok"
         upstreams = (await client.get("/upstreams")).json()
-        assert {u["name"] for u in upstreams} == {"a", "b"}
+        assert {u["name"] for u in upstreams["nodes"]} == {"a", "b"}
+        # 统一链头口径及其判断依据在状态中可见
+        assert upstreams["consensus_head"] == 0
+        assert "quorum" in upstreams and "head_basis" in upstreams
         stats = (await client.get("/quota/alice")).json()
         assert stats["in_flight"] == 0
